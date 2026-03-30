@@ -285,7 +285,7 @@ class CloudflareV3():
             challenge_info = self.extract_v3_challenge_data(resp)
             
             # Wait for the specified delay
-            time.sleep(self.delay)
+            self.cloudscraper._sleep(self.delay)
             
             # Execute the JavaScript VM challenge
             url_parsed = urlparse(resp.url)

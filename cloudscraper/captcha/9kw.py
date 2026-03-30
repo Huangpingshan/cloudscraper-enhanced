@@ -1,7 +1,7 @@
 from __future__ import absolute_import
 
 import re
-import requests
+from curl_cffi import requests
 
 try:
     import polling

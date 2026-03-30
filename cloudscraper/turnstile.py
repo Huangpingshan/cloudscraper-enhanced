@@ -131,7 +131,7 @@ class CloudflareTurnstile():
             turnstile_info = self.extract_turnstile_data(resp)
             
             # Wait for the specified delay
-            time.sleep(self.delay)
+            self.cloudscraper._sleep(self.delay)
             
             # Solve the Turnstile challenge using the captcha provider
             turnstile_response = Captcha.dynamicImport(

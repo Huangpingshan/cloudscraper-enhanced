@@ -48,14 +48,12 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "requests>=2.31.0",
-    "requests-toolbelt>=1.0.0",
+    "curl_cffi>=0.7.0,<1.0",
     "pyparsing>=3.1.0",
     "pyOpenSSL>=24.0.0",
     "pycryptodome>=3.20.0",
     "websocket-client>=1.7.0",
     "js2py>=0.74",
-    "brotli>=1.1.0",
     "certifi>=2024.2.2"
 ]
 
@@ -76,7 +74,7 @@ test = [
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
     "pytest-asyncio>=0.23.0",
-    "responses>=0.24.0"
+    "pytest-httpserver>=1.0.0"
 ]
 
 [project.urls]

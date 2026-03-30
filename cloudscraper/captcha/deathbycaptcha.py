@@ -1,7 +1,7 @@
 from __future__ import absolute_import
 
 import json
-import requests
+from curl_cffi import requests
 try:
     from urlparse import urlparse
 except ImportError:
@@ -62,7 +62,7 @@ class captchaSolver(Captcha):
                 if response.json().get('is_banned'):
                     raise CaptchaServiceUnavailable('DeathByCaptcha: Your account is banned.')
 
-                if response.json().get('balanace') == 0:
+                if response.json().get('balance') == 0:
                     raise CaptchaServiceUnavailable('DeathByCaptcha: insufficient credits.')
 
                 return response

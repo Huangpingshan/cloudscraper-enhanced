@@ -1,9 +1,8 @@
 import json
 import platform
-import requests
+import curl_cffi
 import ssl
 import sys
-import urllib3
 
 from collections import OrderedDict
 from . import __version__ as cloudscraper_version
@@ -55,8 +54,7 @@ def systemInfo():
         ('platform', platform_info),
         ('interpreter', _pythonVersion()),
         ('cloudscraper', cloudscraper_version),
-        ('requests', requests.__version__),
-        ('urllib3', urllib3.__version__),
+        ('curl_cffi', getattr(curl_cffi, '__version__', 'unknown')),
         ('OpenSSL', OrderedDict(
             [
                 ('version', ssl.OPENSSL_VERSION),

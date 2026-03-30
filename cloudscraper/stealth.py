@@ -1,7 +1,13 @@
 import random
+import threading
 import time
 import logging
 from collections import OrderedDict
+
+# ------------------------------------------------------------------------------- #
+
+_DELAY_SPIKE_PROBABILITY = 0.1
+_DELAY_SPIKE_MULTIPLIER = 1.5
 
 # ------------------------------------------------------------------------------- #
 
@@ -18,6 +24,8 @@ class StealthMode:
         :param cloudscraper: The CloudScraper instance
         """
         self.cloudscraper = cloudscraper
+        self._lock = threading.Lock()
+        self._dnt_enabled = random.random() < 0.5
         self.request_count = 0
         self.last_request_time = 0
         self.human_like_delays = True
@@ -81,8 +89,9 @@ class StealthMode:
             kwargs = self._apply_browser_quirks(kwargs)
             
         # Track request count and time
-        self.request_count += 1
-        self.last_request_time = time.time()
+        with self._lock:
+            self.request_count += 1
+            self.last_request_time = time.time()
         
         return kwargs
 
@@ -90,24 +99,21 @@ class StealthMode:
 
     def _apply_human_like_delay(self):
         """
-        Add a random delay between requests to mimic human behavior
+        Add a random delay between requests to mimic human behavior.
+
+        Routes through ``self.cloudscraper._sleep()`` so that an async
+        subclass can override with ``await asyncio.sleep()``.
         """
-        # Skip delay for the first request
-        if self.request_count > 0:
-            # Calculate a random delay
+        with self._lock:
+            should_delay = self.request_count > 0
+        if should_delay:
             delay = random.uniform(self.min_delay, self.max_delay)
-
-            # Add some randomness to make it look more human, but cap it
-            if random.random() < 0.1:  # 10% chance of a longer pause
-                delay *= 1.5  # Reduced from 2x to 1.5x
-
-            # Cap maximum delay to prevent excessive waits
-            delay = min(delay, 10.0)  # Never wait more than 10 seconds
-
-            # Skip delay if it would be too short to matter
+            if random.random() < _DELAY_SPIKE_PROBABILITY:
+                delay *= _DELAY_SPIKE_MULTIPLIER
+            delay = min(delay, 10.0)
             if delay >= 0.1:
                 logging.debug(f"Applying human-like delay of {delay:.2f} seconds")
-                time.sleep(delay)
+                self.cloudscraper._sleep(delay)
 
     # ------------------------------------------------------------------------------- #
 
@@ -122,17 +128,19 @@ class StealthMode:
         
         # Don't modify User-Agent as it's handled by the User_Agent class
         
-        # Randomize Accept header slightly (if not already set)
-        if 'Accept' not in headers:
+        session_headers = self.cloudscraper.headers
+
+        # Randomize Accept header slightly (if not already set in request or session)
+        if 'Accept' not in headers and 'Accept' not in session_headers:
             accepts = [
                 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
                 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             ]
             headers['Accept'] = random.choice(accepts)
-            
-        # Randomize Accept-Language (if not already set)
-        if 'Accept-Language' not in headers:
+
+        # Randomize Accept-Language (if not already set in request or session)
+        if 'Accept-Language' not in headers and 'Accept-Language' not in session_headers:
             languages = [
                 'en-US,en;q=0.9',
                 'en-US,en;q=0.8',
@@ -142,8 +150,8 @@ class StealthMode:
             ]
             headers['Accept-Language'] = random.choice(languages)
             
-        # Add random DNT (Do Not Track) header
-        if random.random() < 0.5:  # 50% chance
+        # Add DNT (Do Not Track) header — consistent per session
+        if self._dnt_enabled:
             headers['DNT'] = '1'
             
         kwargs['headers'] = headers
@@ -170,7 +178,7 @@ class StealthMode:
         # Apply browser-specific headers
         headers = kwargs.get('headers', {})
         for header, value in self.quirks[browser_type]['headers'].items():
-            if header not in headers:
+            if header not in headers and header not in self.cloudscraper.headers:
                 headers[header] = value
                 
         # Reorder headers to match browser's order

@@ -1,6 +1,6 @@
 from __future__ import absolute_import
 
-import requests
+from curl_cffi import requests
 
 try:
     from urlparse import urlparse
@@ -115,7 +115,7 @@ class captchaSolver(Captcha):
 
         payload = {
             'clientKey': self.api_key,
-            'appId': '9E717405-8C70-49B3-B277-7C2F2196484B',
+            'appId': self.app_id,
             'task': {
                 'type': self.captchaType[captchaType],
                 'websiteURL': url,
@@ -158,6 +158,7 @@ class captchaSolver(Captcha):
         if not captchaParams.get('api_key'):
             raise CaptchaParameter("CapSolver: Missing api_key parameter.")
         self.api_key = captchaParams.get('api_key')
+        self.app_id = captchaParams.get('appId', '9E717405-8C70-49B3-B277-7C2F2196484B')
 
         if captchaParams.get('proxy') and not captchaParams.get('no_proxy'):
             hostParsed = urlparse(captchaParams.get('proxy', {}).get('https'))
