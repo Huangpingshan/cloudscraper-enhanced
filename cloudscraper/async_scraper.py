@@ -205,9 +205,12 @@ class AsyncCloudScraper(AsyncSession):
         if not kwargs.get('proxies') and self.proxy_manager.proxies:
             kwargs['proxies'] = self.proxy_manager.get_proxy()
 
-        # Stealth (sync — header manipulation only, delay uses _sleep)
+        # Stealth — compute delay asynchronously, then apply header-only stealth
         if self.enable_stealth:
-            kwargs = self.stealth_mode.apply_stealth_techniques(method, url, **kwargs)
+            delay = self.stealth_mode.compute_human_like_delay()
+            if delay >= 0.1:
+                await self._async_sleep(delay)
+            kwargs = self.stealth_mode.apply_stealth_techniques(method, url, apply_delay=False, **kwargs)
 
         # Perform request
         response = await self.perform_request(method, url, *args, **kwargs)

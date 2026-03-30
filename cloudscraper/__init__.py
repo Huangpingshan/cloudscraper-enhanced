@@ -174,7 +174,7 @@ class CloudScraper(Session):
         self.last_request_time = 0
         self.min_request_interval = cfg.min_request_interval
         self.max_concurrent_requests = cfg.max_concurrent_requests
-        self._concurrent_sem = threading.Semaphore(cfg.max_concurrent_requests)
+        self._concurrent_sem = threading.BoundedSemaphore(cfg.max_concurrent_requests)
         self.rotate_tls_ciphers = cfg.rotate_tls_ciphers
         self._cipher_rotation_count = 0
 
@@ -280,6 +280,29 @@ class CloudScraper(Session):
                 resp.status_code in (301, 302, 303, 307, 308)
                 and 'Location' in resp.headers
             )
+
+        if not hasattr(resp, 'apparent_encoding'):
+            resp.apparent_encoding = getattr(resp, 'charset', None) or 'utf-8'
+
+        if not hasattr(resp, 'links'):
+            links = {}
+            link_header = resp.headers.get('Link', '')
+            if link_header:
+                for part in link_header.split(','):
+                    part = part.strip()
+                    if '<' in part and '>' in part:
+                        url_part = part[part.index('<') + 1:part.index('>')]
+                        params = {}
+                        for param in part[part.index('>') + 1:].split(';'):
+                            param = param.strip()
+                            if '=' in param:
+                                key, val = param.split('=', 1)
+                                params[key.strip()] = val.strip().strip('"')
+                        rel = params.get('rel', url_part)
+                        params['url'] = url_part
+                        links[rel] = params
+            resp.links = links
+
         return resp
 
     # ------------------------------------------------------------------------------- #
