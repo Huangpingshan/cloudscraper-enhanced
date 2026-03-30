@@ -1,24 +1,27 @@
 # ------------------------------------------------------------------------------- #
+# cloudscraper/__init__.py — Assembly-only entry point
+#
+# CloudScraper delegates parameter parsing, fingerprint resolution,
+# transport setup, and session state management to dedicated modules:
+#   config.py        — ScraperConfig dataclass + parse_config()
+#   fingerprint.py   — FingerprintProfile + resolve_profile()
+#   transport_curl.py — curl_cffi session setup + header application
+#   session_state.py  — clone / pickle / restore
+# ------------------------------------------------------------------------------- #
 
 import logging
-import requests
-import sys
 import ssl
+import threading
 import time
-from typing import Optional, Dict, Any, Union, List
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
-from requests.adapters import HTTPAdapter
-from requests.sessions import Session
-from requests_toolbelt.utils import dump
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests import Session
 
 # ------------------------------------------------------------------------------- #
 
-try:
-    import brotli
-except ImportError:
-    pass
-
-import copyreg
 from urllib.parse import urlparse
 
 # ------------------------------------------------------------------------------- #
@@ -39,6 +42,16 @@ from .user_agent import User_Agent
 from .proxy_manager import ProxyManager
 from .stealth import StealthMode
 
+from .config import ScraperConfig, parse_config
+from .fingerprint import (
+    FingerprintProfile, resolve_profile,
+    FINGERPRINT_HEADER_KEYS, _IMPERSONATE_UA_MAP,
+)
+from .transport_curl import apply_profile_headers, apply_curl_options
+from .session_state import (
+    clone_session_attrs, get_picklable_state, restore_from_state,
+)
+
 # ------------------------------------------------------------------------------- #
 
 __version__ = '3.0.0'
@@ -46,202 +59,166 @@ __version__ = '3.0.0'
 # ------------------------------------------------------------------------------- #
 
 
-class CipherSuiteAdapter(HTTPAdapter):
+@dataclass
+class _RequestChain:
+    """Per-request-chain state, isolated via ContextVar.
 
-    __attrs__ = [
-        'ssl_context',
-        'max_retries',
-        'config',
-        '_pool_connections',
-        '_pool_maxsize',
-        '_pool_block',
-        'source_address'
-    ]
+    Each top-level request() creates one of these.  Recursive calls
+    (challenge handlers, 403 retries) share the same chain instance,
+    incrementing depth so only the root dispatches hooks.
+    """
+    depth: int = 0
+    solve_depth_cnt: int = 0
+    retry_403_count: int = 0
+    in_403_retry: bool = False
 
-    def __init__(self, *args, **kwargs):
-        self.ssl_context = kwargs.pop('ssl_context', None)
-        self.cipherSuite = kwargs.pop('cipherSuite', None)
-        self.source_address = kwargs.pop('source_address', None)
-        self.server_hostname = kwargs.pop('server_hostname', None)
-        self.ecdhCurve = kwargs.pop('ecdhCurve', 'prime256v1')
 
-        if self.source_address:
-            if isinstance(self.source_address, str):
-                self.source_address = (self.source_address, 0)
-
-            if not isinstance(self.source_address, tuple):
-                raise TypeError(
-                    "source_address must be IP address string or (ip, port) tuple"
-                )
-
-        if not self.ssl_context:
-            self.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-
-            self.ssl_context.orig_wrap_socket = self.ssl_context.wrap_socket
-            self.ssl_context.wrap_socket = self.wrap_socket
-
-            if self.server_hostname:
-                self.ssl_context.server_hostname = self.server_hostname
-
-            self.ssl_context.set_ciphers(self.cipherSuite)
-            self.ssl_context.set_ecdh_curve(self.ecdhCurve)
-
-            self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-            self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
-
-        super(CipherSuiteAdapter, self).__init__(**kwargs)
-
-    # ------------------------------------------------------------------------------- #
-
-    def wrap_socket(self, *args, **kwargs):
-        if hasattr(self.ssl_context, 'server_hostname') and self.ssl_context.server_hostname:
-            kwargs['server_hostname'] = self.ssl_context.server_hostname
-            self.ssl_context.check_hostname = False
-        else:
-            self.ssl_context.check_hostname = True
-
-        return self.ssl_context.orig_wrap_socket(*args, **kwargs)
-
-    # ------------------------------------------------------------------------------- #
-
-    def init_poolmanager(self, *args, **kwargs):
-        kwargs['ssl_context'] = self.ssl_context
-        kwargs['source_address'] = self.source_address
-        return super(CipherSuiteAdapter, self).init_poolmanager(*args, **kwargs)
-
-    # ------------------------------------------------------------------------------- #
-
-    def proxy_manager_for(self, *args, **kwargs):
-        kwargs['ssl_context'] = self.ssl_context
-        kwargs['source_address'] = self.source_address
-        return super(CipherSuiteAdapter, self).proxy_manager_for(*args, **kwargs)
-
-# ------------------------------------------------------------------------------- #
+_current_chain: ContextVar[Optional[_RequestChain]] = ContextVar(
+    '_current_chain', default=None
+)
 
 
 class CloudScraper(Session):
 
+    _browsers_data_cache = None
+    _browsers_data_lock = threading.Lock()
+
+    @classmethod
+    def _get_browsers_data(cls):
+        if cls._browsers_data_cache is None:
+            with cls._browsers_data_lock:
+                if cls._browsers_data_cache is None:
+                    import json
+                    import os
+                    browsers_file = os.path.join(
+                        os.path.dirname(__file__), 'user_agent', 'browsers.json'
+                    )
+                    with open(browsers_file, 'r') as f:
+                        cls._browsers_data_cache = json.load(f)
+        return cls._browsers_data_cache
+
     def __init__(self, *args, **kwargs):
-        self.debug = kwargs.pop('debug', False)
+        # ---- Step 1: Parse config (modifies kwargs in-place) ----
+        self._config = parse_config(kwargs)
+        cfg = self._config
 
-        # Cloudflare challenge handling options
-        self.disableCloudflareV1 = kwargs.pop('disableCloudflareV1', False)
-        self.disableCloudflareV2 = kwargs.pop('disableCloudflareV2', False)
-        self.disableCloudflareV3 = kwargs.pop('disableCloudflareV3', False)
-        self.disableTurnstile = kwargs.pop('disableTurnstile', False)
-        self.delay = kwargs.pop('delay', None)
-        self.captcha = kwargs.pop('captcha', {})
-        self.doubleDown = kwargs.pop('doubleDown', True)
-        self.interpreter = kwargs.pop('interpreter', 'js2py')  # Default to js2py for better compatibility
-
-        # Request hooks
-        self.requestPreHook = kwargs.pop('requestPreHook', None)
-        self.requestPostHook = kwargs.pop('requestPostHook', None)
-
-        # TLS/SSL options
-        self.cipherSuite = kwargs.pop('cipherSuite', None)
-        self.ecdhCurve = kwargs.pop('ecdhCurve', 'prime256v1')
-        self.source_address = kwargs.pop('source_address', None)
-        self.server_hostname = kwargs.pop('server_hostname', None)
-        self.ssl_context = kwargs.pop('ssl_context', None)
-
-        # Compression options
-        self.allow_brotli = kwargs.pop(
-            'allow_brotli',
-            True if 'brotli' in sys.modules.keys() else False
-        )
-
-        # User agent handling
+        # ---- Step 2: Build User_Agent for custom UA / cipher data ----
         self.user_agent = User_Agent(
-            allow_brotli=self.allow_brotli,
-            browser=kwargs.pop('browser', None)
+            allow_brotli=cfg.allow_brotli,
+            browser=cfg.browser_arg_raw,
         )
 
-        # Challenge solving depth
-        self._solveDepthCnt = 0
-        self.solveDepth = kwargs.pop('solveDepth', 3)
+        # ---- Step 3: Resolve fingerprint profile ----
+        self._profile = resolve_profile(cfg, self.user_agent)
 
-        # Session health monitoring
+        # ---- Step 4: Initialize curl_cffi Session with impersonate ----
+        super(CloudScraper, self).__init__(
+            impersonate=self._profile.impersonate,
+            *args,
+            **kwargs
+        )
+
+        # ---- Step 5: Apply profile headers + curl_options ----
+        apply_profile_headers(self, self._profile, cfg.caller_headers)
+        apply_curl_options(self, self._profile)
+
+        # ---- Step 6: Expose config attributes on self ----
+        # (challenge handlers read self.debug, self.captcha, etc.)
+        self.impersonate = self._profile.impersonate
+        self.debug = cfg.debug
+        self.delay = cfg.delay
+        self.captcha = cfg.captcha
+        self.doubleDown = cfg.doubleDown
+        self.interpreter = cfg.interpreter
+        self.solveDepth = cfg.solveDepth
+        self.requestPreHook = cfg.requestPreHook
+        self.requestPostHook = cfg.requestPostHook
+        self.disableCloudflareV1 = cfg.disableCloudflareV1
+        self.disableCloudflareV2 = cfg.disableCloudflareV2
+        self.disableCloudflareV3 = cfg.disableCloudflareV3
+        self.disableTurnstile = cfg.disableTurnstile
+        self.allow_brotli = cfg.allow_brotli
+        self.enable_stealth = cfg.enable_stealth
+
+        # TLS state (for cipher rotation)
+        self.cipherSuite = cfg.cipherSuite
+        self.ecdhCurve = cfg.ecdhCurve
+        self._explicit_cipherSuite = cfg.explicit_cipherSuite
+        self._custom_ua = self._profile.is_custom_ua
+
+        # Populate cipherSuite from User_Agent for rotation feature
+        if not self.cipherSuite:
+            self.cipherSuite = self.user_agent.cipherSuite
+        if isinstance(self.cipherSuite, list):
+            self.cipherSuite = ':'.join(self.cipherSuite)
+
+        # Kept for backward compat — always None with curl_cffi
+        self.ssl_context = None
+
+        # ---- Step 7: Initialize subsystems ----
+        # Per-request-chain state (solve depth, 403 retry) is managed via
+        # ContextVar (_current_chain) — not stored on self.  This makes
+        # concurrent requests (threads AND asyncio tasks) fully isolated.
+
+        # Session health monitoring — shared across all requests, guarded by lock
+        self._state_lock = threading.Lock()
+        self._in_refresh = False  # guard against recursive refresh
         self.session_start_time = time.time()
         self.request_count = 0
         self.last_403_time = 0
-        self.session_refresh_interval = kwargs.pop('session_refresh_interval', 3600)  # 1 hour default
-        self.auto_refresh_on_403 = kwargs.pop('auto_refresh_on_403', True)
-        self.max_403_retries = kwargs.pop('max_403_retries', 3)
-        self._403_retry_count = 0
+        self.session_refresh_interval = cfg.session_refresh_interval
+        self.auto_refresh_on_403 = cfg.auto_refresh_on_403
+        self.max_403_retries = cfg.max_403_retries
 
-        # Request throttling and TLS management
+        # Request throttling — semaphore replaces busy-wait loop
         self.last_request_time = 0
-        self.min_request_interval = kwargs.pop('min_request_interval', 1.0)  # Minimum 1 second between requests
-        self.max_concurrent_requests = kwargs.pop('max_concurrent_requests', 1)  # Limit concurrent requests
-        self.current_concurrent_requests = 0
-        self.rotate_tls_ciphers = kwargs.pop('rotate_tls_ciphers', True)  # Enable TLS cipher rotation
+        self.min_request_interval = cfg.min_request_interval
+        self.max_concurrent_requests = cfg.max_concurrent_requests
+        self._concurrent_sem = threading.Semaphore(cfg.max_concurrent_requests)
+        self.rotate_tls_ciphers = cfg.rotate_tls_ciphers
         self._cipher_rotation_count = 0
 
         # Proxy management
-        proxy_options = kwargs.pop('proxy_options', {})
         self.proxy_manager = ProxyManager(
-            proxies=kwargs.pop('rotating_proxies', None),
-            proxy_rotation_strategy=proxy_options.get('rotation_strategy', 'sequential'),
-            ban_time=proxy_options.get('ban_time', 300)
+            proxies=cfg.rotating_proxies,
+            proxy_rotation_strategy=cfg.proxy_options.get('rotation_strategy', 'sequential'),
+            ban_time=cfg.proxy_options.get('ban_time', 300),
         )
 
         # Stealth mode
         self.stealth_mode = StealthMode(self)
-        self.enable_stealth = kwargs.pop('enable_stealth', True)
-
-        # Stealth mode configuration
-        stealth_options = kwargs.pop('stealth_options', {})
+        stealth_options = cfg.stealth_options
         if stealth_options:
             if 'min_delay' in stealth_options and 'max_delay' in stealth_options:
                 self.stealth_mode.set_delay_range(
                     stealth_options['min_delay'],
-                    stealth_options['max_delay']
+                    stealth_options['max_delay'],
                 )
             self.stealth_mode.enable_human_like_delays(stealth_options.get('human_like_delays', True))
             self.stealth_mode.enable_randomize_headers(stealth_options.get('randomize_headers', True))
             self.stealth_mode.enable_browser_quirks(stealth_options.get('browser_quirks', True))
 
-        # Initialize the session
-        super(CloudScraper, self).__init__(*args, **kwargs)
+        # ---- Step 8: Initialize requests-style hooks dict ----
+        # curl_cffi Session doesn't provide this; we set it so that
+        # scraper.hooks['response'].append(fn) works out of the box.
+        self.hooks = {'response': []}
 
-        # Set up User-Agent and headers
-        if 'requests' in self.headers.get('User-Agent', ''):
-            # Set a random User-Agent if no custom User-Agent has been set
-            self.headers = self.user_agent.headers
-            if not self.cipherSuite:
-                self.cipherSuite = self.user_agent.cipherSuite
-
-        if isinstance(self.cipherSuite, list):
-            self.cipherSuite = ':'.join(self.cipherSuite)
-
-        # Mount the HTTPS adapter with our custom cipher suite
-        self.mount(
-            'https://',
-            CipherSuiteAdapter(
-                cipherSuite=self.cipherSuite,
-                ecdhCurve=self.ecdhCurve,
-                server_hostname=self.server_hostname,
-                source_address=self.source_address,
-                ssl_context=self.ssl_context
-            )
-        )
-
-        # Initialize Cloudflare handlers
+        # ---- Step 9: Initialize Cloudflare handlers ----
         self.cloudflare_v1 = Cloudflare(self)
         self.cloudflare_v2 = CloudflareV2(self)
         self.cloudflare_v3 = CloudflareV3(self)
         self.turnstile = CloudflareTurnstile(self)
 
-        # Allow pickle serialization
-        copyreg.pickle(ssl.SSLContext, lambda obj: (obj.__class__, (obj.protocol,)))
-
     # ------------------------------------------------------------------------------- #
-    # Allow us to pickle our session back with all variables
+    # Pickle support via session_state module
     # ------------------------------------------------------------------------------- #
 
     def __getstate__(self):
-        return self.__dict__
+        return get_picklable_state(self)
+
+    def __setstate__(self, state):
+        restored = restore_from_state(state)
+        self.__dict__.update(restored.__dict__)
 
     # ------------------------------------------------------------------------------- #
     # Allow replacing actual web request call via subclassing
@@ -251,130 +228,199 @@ class CloudScraper(Session):
         return super(CloudScraper, self).request(method, url, *args, **kwargs)
 
     # ------------------------------------------------------------------------------- #
-    # Raise an Exception with no stacktrace and reset depth counter.
+    # Sleeps — override in async subclass with `await asyncio.sleep()`
+    # ------------------------------------------------------------------------------- #
+
+    def _sleep(self, seconds):
+        """Sleep for the given number of seconds.
+
+        Override this in an async subclass to use ``await asyncio.sleep(seconds)``
+        instead of the blocking ``time.sleep()``.  All internal sleep calls
+        (throttling, stealth delays, challenge delays) route through here.
+        """
+        time.sleep(seconds)
+
     # ------------------------------------------------------------------------------- #
 
     def simpleException(self, exception, msg):
-        self._solveDepthCnt = 0
-        sys.tracebacklimit = 0
+        chain = _current_chain.get(None)
+        if chain is not None:
+            chain.solve_depth_cnt = 0
         raise exception(msg)
 
-    # ------------------------------------------------------------------------------- #
-    # debug the request via the response
     # ------------------------------------------------------------------------------- #
 
     @staticmethod
     def debugRequest(req):
         try:
-            print(dump.dump_all(req).decode('utf-8', errors='backslashreplace'))
-        except ValueError as e:
+            print(f"--- Debug Request ---")
+            print(f"URL: {req.url}")
+            print(f"Status: {req.status_code}")
+            print(f"Headers: {dict(req.headers)}")
+            print(f"--- End Debug ---")
+        except Exception as e:
             print(f"Debug Error: {getattr(e, 'message', e)}")
 
     # ------------------------------------------------------------------------------- #
-    # Decode Brotli on older versions of urllib3 manually
-    # ------------------------------------------------------------------------------- #
 
     def decodeBrotli(self, resp):
-        if requests.packages.urllib3.__version__ < '1.25.1' and resp.headers.get('Content-Encoding') == 'br':
-            if self.allow_brotli and resp._content:
-                resp._content = brotli.decompress(resp.content)
-            else:
-                logging.warning(
-                    f'You\'re running urllib3 {requests.packages.urllib3.__version__}, Brotli content detected, '
-                    'Which requires manual decompression, '
-                    'But option allow_brotli is set to False, '
-                    'We will not continue to decompress.'
-                )
+        return resp
 
+    @staticmethod
+    def _adapt_response(resp):
+        """Patch requests-compatible properties onto a curl_cffi Response.
+
+        curl_cffi.Response lacks some properties that the original
+        requests.Response exposes (e.g. is_redirect).  Challenge handlers
+        and user code may rely on them, so we add them here once rather
+        than scattering compat checks across every consumer.
+        """
+        if not hasattr(resp, 'is_redirect'):
+            resp.is_redirect = (
+                resp.status_code in (301, 302, 303, 307, 308)
+                and 'Location' in resp.headers
+            )
         return resp
 
     # ------------------------------------------------------------------------------- #
-    # Our hijacker request function
+    # Request hijacker
     # ------------------------------------------------------------------------------- #
 
+    @staticmethod
+    def _normalize_hooks(value):
+        """Normalize a hooks 'response' value to a flat list of callables.
+
+        Accepts the same forms as the requests library:
+        - None                  → []
+        - single callable       → [callable]
+        - list/tuple of callables → list(...)
+        """
+        if value is None:
+            return []
+        if callable(value):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        raise TypeError(
+            f"hooks 'response' value must be callable or a list of callables, "
+            f"got {type(value).__name__}"
+        )
+
+    def _dispatch_hooks(self, response, request_hooks=None, **hook_kwargs):
+        """Dispatch requests-style response hooks (session-level + per-request).
+
+        Each hook receives (response, **kwargs) and may return a replacement
+        response.  This mirrors the requests library convention where hooks
+        are called as ``hook(response, **kwargs)``.
+        """
+        all_hooks = []
+        session_hooks = self.hooks
+        if session_hooks and isinstance(session_hooks, dict):
+            all_hooks.extend(self._normalize_hooks(session_hooks.get('response')))
+        if request_hooks and isinstance(request_hooks, dict):
+            all_hooks.extend(self._normalize_hooks(request_hooks.get('response')))
+
+        for hook in all_hooks:
+            result = hook(response, **hook_kwargs)
+            if result is not None:
+                response = result
+
+        return response
+
     def request(self, method, url, *args, **kwargs):
-        # Apply request throttling to prevent TLS blocking
+        """Thin wrapper that owns hook dispatch.
+
+        Only the outermost request() dispatches response hooks (both
+        session-level self.hooks and per-request hooks= kwarg).  Challenge
+        handlers and 403-retry paths recurse through this method, but the
+        depth counter ensures hooks fire exactly once on the final response.
+
+        The request chain is stored in a ContextVar so that concurrent
+        requests from different threads AND different asyncio tasks each
+        get independent dispatch ownership.
+        """
+        request_hooks = kwargs.pop('hooks', None)
+        chain = _current_chain.get(None)
+        is_root = chain is None
+        if is_root:
+            chain = _RequestChain()
+            token = _current_chain.set(chain)
+            self._concurrent_sem.acquire()
+        chain.depth += 1
+        try:
+            response = self._request_core(method, url, *args, **kwargs)
+        finally:
+            chain.depth -= 1
+            if is_root:
+                self._concurrent_sem.release()
+                _current_chain.reset(token)
+
+        if is_root:
+            response = self._dispatch_hooks(
+                response, request_hooks, method=method, url=url,
+            )
+
+        return response
+
+    def _request_core(self, method, url, *args, **kwargs):
+        """Core request logic: throttling, network call, challenge handling.
+
+        Contains zero _dispatch_hooks() calls — hook dispatch is owned
+        exclusively by the outermost request() wrapper.
+
+        Per-request-chain state (solve depth, 403 retries) lives in the
+        ContextVar-backed _RequestChain, not on self.
+        """
+        chain = _current_chain.get()
+
+        # Apply request throttling
         self._apply_request_throttling()
 
-        # Rotate TLS cipher suites to avoid detection
-        if self.rotate_tls_ciphers:
+        # TLS cipher rotation — requires both profile capability AND user toggle
+        if self.rotate_tls_ciphers and self._profile.can_rotate_tls:
             self._rotate_tls_cipher_suite()
 
-        # Check if session needs refresh due to age
+        # Check if session needs refresh
         if self._should_refresh_session():
             self._refresh_session(url)
 
-        # Handle proxy rotation if no specific proxies are provided
+        # Proxy rotation
         if not kwargs.get('proxies') and hasattr(self, 'proxy_manager') and self.proxy_manager.proxies:
             kwargs['proxies'] = self.proxy_manager.get_proxy()
         elif kwargs.get('proxies') and kwargs.get('proxies') != self.proxies:
             self.proxies = kwargs.get('proxies')
 
-        # Apply stealth techniques if enabled
+        # Stealth
         if self.enable_stealth:
             kwargs = self.stealth_mode.apply_stealth_techniques(method, url, **kwargs)
 
-        # Track request count
-        self.request_count += 1
+        with self._state_lock:
+            self.request_count += 1
 
-        # Track concurrent requests
-        self.current_concurrent_requests += 1
-
-        # ------------------------------------------------------------------------------- #
-        # Pre-Hook the request via user defined function.
-        # ------------------------------------------------------------------------------- #
-
+        # Pre-Hook (cloudscraper-specific)
         if self.requestPreHook:
             (method, url, args, kwargs) = self.requestPreHook(
-                self,
-                method,
-                url,
-                *args,
-                **kwargs
+                self, method, url, *args, **kwargs
             )
 
-        # ------------------------------------------------------------------------------- #
-        # Make the request via requests.
-        # ------------------------------------------------------------------------------- #
-
+        # Perform the request
         try:
-            response = self.decodeBrotli(
+            response = self._adapt_response(self.decodeBrotli(
                 self.perform_request(method, url, *args, **kwargs)
-            )
-
-            # Report successful proxy use if applicable
+            ))
             if kwargs.get('proxies') and hasattr(self, 'proxy_manager'):
                 self.proxy_manager.report_success(kwargs['proxies'])
-
-        except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError) as e:
-            # Report failed proxy use if applicable
+        except curl_requests.errors.RequestsError as e:
             if kwargs.get('proxies') and hasattr(self, 'proxy_manager'):
                 self.proxy_manager.report_failure(kwargs['proxies'])
-
-            # CRITICAL FIX: Always decrement concurrent request counter on exception
-            if self.current_concurrent_requests > 0:
-                self.current_concurrent_requests -= 1
-            raise e
-        except Exception as e:
-            # CRITICAL FIX: Always decrement concurrent request counter on any exception
-            if self.current_concurrent_requests > 0:
-                self.current_concurrent_requests -= 1
-            raise e
-
-        # ------------------------------------------------------------------------------- #
-        # Debug the request via the Response object.
-        # ------------------------------------------------------------------------------- #
+            raise
 
         if self.debug:
             self.debugRequest(response)
 
-        # ------------------------------------------------------------------------------- #
-        # Post-Hook the request aka Post-Hook the response via user defined function.
-        # ------------------------------------------------------------------------------- #
-
+        # Post-Hook (cloudscraper-specific)
         if self.requestPostHook:
             newResponse = self.requestPostHook(self, response)
-
             if response != newResponse:
                 response = newResponse
                 if self.debug:
@@ -382,359 +428,247 @@ class CloudScraper(Session):
                     self.debugRequest(response)
 
         # ------------------------------------------------------------------------------- #
-        # Handle Cloudflare challenges
+        # Cloudflare challenge handling
+        #
+        # Challenge handlers call self.cloudscraper.request() internally,
+        # which re-enters request() (the wrapper).  The depth counter in
+        # the wrapper ensures hooks are NOT dispatched on those inner calls.
+        # Only the outermost wrapper dispatches hooks on whatever response
+        # ultimately bubbles up.
         # ------------------------------------------------------------------------------- #
 
-        # Check for loop protection
-        if self._solveDepthCnt >= self.solveDepth:
-            _ = self._solveDepthCnt
+        if chain.solve_depth_cnt >= self.solveDepth:
+            cnt = chain.solve_depth_cnt
             self.simpleException(
                 CloudflareLoopProtection,
-                f"!!Loop Protection!! We have tried to solve {_} time(s) in a row."
+                f"!!Loop Protection!! We have tried to solve {cnt} time(s) in a row."
             )
 
-        # Check for Cloudflare Turnstile challenges first (if not disabled)
         if not self.disableTurnstile:
-            # Check for Turnstile Challenge
             if self.turnstile.is_Turnstile_Challenge(response):
                 if self.debug:
                     print('Detected a Cloudflare Turnstile challenge.')
-                self._solveDepthCnt += 1
-                response = self.turnstile.handle_Turnstile_Challenge(response, **kwargs)
-                return response
+                chain.solve_depth_cnt += 1
+                return self.turnstile.handle_Turnstile_Challenge(response, **kwargs)
 
-        # Check for Cloudflare v3 challenges (if not disabled)
         if not self.disableCloudflareV3:
-            # Check for v3 JavaScript VM Challenge
             if self.cloudflare_v3.is_V3_Challenge(response):
                 if self.debug:
                     print('Detected a Cloudflare v3 JavaScript VM challenge.')
-                self._solveDepthCnt += 1
-                response = self.cloudflare_v3.handle_V3_Challenge(response, **kwargs)
-                return response
+                chain.solve_depth_cnt += 1
+                return self.cloudflare_v3.handle_V3_Challenge(response, **kwargs)
 
-        # Check for Cloudflare v2 challenges (if not disabled)
         if not self.disableCloudflareV2:
-            # Check for v2 Captcha Challenge
             if self.cloudflare_v2.is_V2_Captcha_Challenge(response):
-                self._solveDepthCnt += 1
-                response = self.cloudflare_v2.handle_V2_Captcha_Challenge(response, **kwargs)
-                return response
-
-            # Check for v2 JavaScript Challenge
+                chain.solve_depth_cnt += 1
+                return self.cloudflare_v2.handle_V2_Captcha_Challenge(response, **kwargs)
             if self.cloudflare_v2.is_V2_Challenge(response):
-                self._solveDepthCnt += 1
-                response = self.cloudflare_v2.handle_V2_Challenge(response, **kwargs)
-                return response
+                chain.solve_depth_cnt += 1
+                return self.cloudflare_v2.handle_V2_Challenge(response, **kwargs)
 
-        # Check for Cloudflare v1 challenges (if not disabled)
         if not self.disableCloudflareV1:
-            # Check if Cloudflare v1 anti-bot is on
             if self.cloudflare_v1.is_Challenge_Request(response):
-                # Try to solve the challenge and send it back
-                self._solveDepthCnt += 1
-                response = self.cloudflare_v1.Challenge_Response(response, **kwargs)
-                return response
+                chain.solve_depth_cnt += 1
+                return self.cloudflare_v1.Challenge_Response(response, **kwargs)
 
-        # Reset solve depth counter if no challenge was detected
-        if not response.is_redirect and response.status_code not in [429, 503]:
-            self._solveDepthCnt = 0
-            # Reset 403 retry count on successful request (ONLY if not in retry mode)
-            if response.status_code == 200 and not hasattr(self, '_in_403_retry'):
-                self._403_retry_count = 0
+        # Reset solve depth
+        is_redirect = response.is_redirect
+        if not is_redirect and response.status_code not in [429, 503]:
+            chain.solve_depth_cnt = 0
+            if response.status_code == 200 and not chain.in_403_retry:
+                chain.retry_403_count = 0
 
-        # Handle 403 errors with automatic session refresh
+        # Handle 403 — the retry calls self.request() (the wrapper), which
+        # increments depth.  The inner call won't dispatch hooks; the
+        # outermost wrapper dispatches once when the final response arrives.
         if response.status_code == 403 and self.auto_refresh_on_403:
-            if self._403_retry_count < self.max_403_retries:
-                self._403_retry_count += 1
-                self.last_403_time = time.time()
+            if chain.retry_403_count < self.max_403_retries:
+                chain.retry_403_count += 1
+                with self._state_lock:
+                    self.last_403_time = time.time()
 
                 if self.debug:
-                    print(f'🛡️ Received 403 error, attempting session refresh (attempt {self._403_retry_count}/{self.max_403_retries})')
+                    print(f'Received 403 error, attempting session refresh (attempt {chain.retry_403_count}/{self.max_403_retries})')
 
-                # Try to refresh the session and retry the request
                 if self._refresh_session(url):
                     if self.debug:
-                        print(f'🔄 Session refreshed successfully, retrying original request...')
+                        print(f'Session refreshed successfully, retrying original request...')
 
-                    # Mark that we're in a retry to prevent retry count reset
-                    self._in_403_retry = True
+                    chain.in_403_retry = True
                     try:
-                        # Retry the original request
                         retry_response = self.request(method, url, *args, **kwargs)
-
-                        # If retry was successful, reset retry count and return
                         if retry_response.status_code == 200:
-                            self._403_retry_count = 0
+                            chain.retry_403_count = 0
+                            with self._state_lock:
+                                self.last_403_time = 0
                             if self.debug:
-                                print('✅ 403 retry successful, request completed')
-
+                                print('403 retry successful, request completed')
                         return retry_response
                     finally:
-                        # Always clear the retry flag
-                        if hasattr(self, '_in_403_retry'):
-                            delattr(self, '_in_403_retry')
+                        chain.in_403_retry = False
                 else:
                     if self.debug:
-                        print('❌ Session refresh failed, returning 403 response')
+                        print('Session refresh failed, returning 403 response')
             else:
+                with self._state_lock:
+                    self.last_403_time = 0
                 if self.debug:
-                    print(f'❌ Max 403 retries ({self.max_403_retries}) exceeded, returning 403 response')
-
-        # Decrement concurrent request counter
-        if self.current_concurrent_requests > 0:
-            self.current_concurrent_requests -= 1
+                    print(f'Max 403 retries ({self.max_403_retries}) exceeded, returning 403 response')
 
         return response
 
     # ------------------------------------------------------------------------------- #
-    # Session health monitoring and refresh methods
+    # Session health monitoring
     # ------------------------------------------------------------------------------- #
 
     def _should_refresh_session(self):
-        """
-        Check if the session should be refreshed based on age and other factors
-        """
-        current_time = time.time()
-        session_age = current_time - self.session_start_time
-
-        # Refresh if session is older than the configured interval
-        if session_age > self.session_refresh_interval:
-            return True
-
-        # Refresh if we've had recent 403 errors
-        if self.last_403_time > 0 and (current_time - self.last_403_time) < 60:
-            return True
-
-        return False
+        with self._state_lock:
+            if self._in_refresh:
+                return False
+            current_time = time.time()
+            session_age = current_time - self.session_start_time
+            if session_age > self.session_refresh_interval:
+                return True
+            if self.last_403_time > 0 and (current_time - self.last_403_time) < 60:
+                return True
+            return False
 
     def _refresh_session(self, url):
-        """
-        Refresh the session by clearing cookies and re-establishing connection
-        """
+        with self._state_lock:
+            if self._in_refresh:
+                return False
+            self._in_refresh = True
+
         try:
             if self.debug:
                 print('Refreshing session due to staleness or 403 errors...')
-
-            # Clear existing Cloudflare cookies
             self._clear_cloudflare_cookies()
+            with self._state_lock:
+                self.session_start_time = time.time()
+                self.request_count = 0
 
-            # Reset session tracking (but NOT the retry count yet)
-            self.session_start_time = time.time()
-            self.request_count = 0
-
-            # Generate new user agent to avoid fingerprint detection
-            if hasattr(self, 'user_agent'):
-                self.user_agent.loadUserAgent()
-                self.headers.update(self.user_agent.headers)
-
-            # Make a simple request to re-establish session
+            # Re-apply the immutable profile headers instead of regenerating
+            # User_Agent. This preserves the exact fingerprint (including
+            # custom UAs) across refreshes.
+            apply_profile_headers(self, self._profile, self._config.caller_headers)
             try:
-                from urllib.parse import urlparse
                 parsed_url = urlparse(url)
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-
-                # Make a lightweight request to trigger challenge solving
-                test_response = super(CloudScraper, self).get(base_url, timeout=30)
-
+                # Use self.get() so challenge handling is active during refresh.
+                # _in_refresh prevents recursive refresh calls.
+                test_response = self.get(base_url, timeout=30)
                 if self.debug:
                     print(f'Session refresh request status: {test_response.status_code}')
-
-                # Only return True if we got a successful response
                 success = test_response.status_code in [200, 301, 302, 304]
-
                 if success and self.debug:
-                    print('✅ Session refresh successful')
+                    print('Session refresh successful')
                 elif not success and self.debug:
-                    print(f'❌ Session refresh failed with status: {test_response.status_code}')
-
+                    print(f'Session refresh failed with status: {test_response.status_code}')
                 return success
-
             except Exception as e:
                 if self.debug:
-                    print(f'❌ Session refresh failed: {e}')
+                    print(f'Session refresh failed: {e}')
                 return False
-
         except Exception as e:
             if self.debug:
-                print(f'❌ Error during session refresh: {e}')
+                print(f'Error during session refresh: {e}')
             return False
+        finally:
+            with self._state_lock:
+                self._in_refresh = False
 
     def _clear_cloudflare_cookies(self):
-        """
-        Clear Cloudflare-specific cookies to force re-authentication
-        """
         cf_cookie_names = ['cf_clearance', 'cf_chl_2', 'cf_chl_prog', 'cf_chl_rc_ni', 'cf_turnstile', '__cf_bm']
-
-        for cookie_name in cf_cookie_names:
-            # Remove cookies for all domains
-            for domain in list(self.cookies.list_domains()):
-                try:
-                    self.cookies.clear(domain, '/', cookie_name)
-                except:
-                    pass
-
+        remove_list = []
+        for cookie in self.cookies.jar:
+            if cookie.name in cf_cookie_names:
+                remove_list.append(cookie)
+        for cookie in remove_list:
+            self.cookies.jar.clear(cookie.domain, cookie.path, cookie.name)
         if self.debug:
             print('Cleared Cloudflare cookies for session refresh')
 
     def _apply_request_throttling(self):
-        """
-        Apply request throttling to prevent TLS blocking from concurrent requests
-        """
-        current_time = time.time()
+        with self._state_lock:
+            current_time = time.time()
+            time_since_last_request = current_time - self.last_request_time
+            if time_since_last_request < self.min_request_interval:
+                sleep_time = self.min_request_interval - time_since_last_request
+            else:
+                sleep_time = 0
+            # Claim the slot immediately so other threads see the updated time
+            # and compute their own sleep accordingly, even before we actually sleep.
+            self.last_request_time = current_time + sleep_time
 
-        # Wait for minimum interval between requests
-        time_since_last_request = current_time - self.last_request_time
-        if time_since_last_request < self.min_request_interval:
-            sleep_time = self.min_request_interval - time_since_last_request
+        if sleep_time > 0:
             if self.debug:
-                print(f'⏱️ Request throttling: sleeping {sleep_time:.2f}s')
-            time.sleep(sleep_time)
-
-        # Wait if too many concurrent requests
-        while self.current_concurrent_requests >= self.max_concurrent_requests:
-            if self.debug:
-                print(f'🚦 Concurrent request limit reached ({self.current_concurrent_requests}/{self.max_concurrent_requests}), waiting...')
-            time.sleep(0.1)
-
-        self.last_request_time = time.time()
+                print(f'Request throttling: sleeping {sleep_time:.2f}s')
+            self._sleep(sleep_time)
 
     def _rotate_tls_cipher_suite(self):
-        """
-        Rotate TLS cipher suites to avoid detection patterns
-        """
+        """Rotate TLS cipher suites (only when caller explicitly set cipherSuite=
+        AND rotate_tls_ciphers is enabled)."""
+        if not self._explicit_cipherSuite:
+            return
+        if not self.rotate_tls_ciphers:
+            return
         if not hasattr(self, 'user_agent') or not hasattr(self.user_agent, 'cipherSuite'):
             return
-
-        # Get available cipher suites for current browser
         browser_name = getattr(self.user_agent, 'browser', 'chrome')
-
         try:
-            # Get cipher suites from browsers.json
-            import json
-            import os
-            browsers_file = os.path.join(os.path.dirname(__file__), 'user_agent', 'browsers.json')
-
-            with open(browsers_file, 'r') as f:
-                browsers_data = json.load(f)
-
+            browsers_data = self._get_browsers_data()
             available_ciphers = browsers_data.get('cipherSuite', {}).get(browser_name, [])
-
             if available_ciphers and len(available_ciphers) > 1:
-                # Rotate through cipher suites
-                self._cipher_rotation_count += 1
-                cipher_index = self._cipher_rotation_count % len(available_ciphers)
-
-                # Use a subset of ciphers to create variation
-                num_ciphers = min(8, len(available_ciphers))  # Use up to 8 ciphers
-                start_index = cipher_index % (len(available_ciphers) - num_ciphers + 1)
-                selected_ciphers = available_ciphers[start_index:start_index + num_ciphers]
-
-                new_cipher_suite = ':'.join(selected_ciphers)
-
-                if new_cipher_suite != self.cipherSuite:
-                    self.cipherSuite = new_cipher_suite
-
-                    # Update the HTTPS adapter with new cipher suite
-                    self.mount(
-                        'https://',
-                        CipherSuiteAdapter(
-                            cipherSuite=self.cipherSuite,
-                            ecdhCurve=self.ecdhCurve,
-                            server_hostname=self.server_hostname,
-                            source_address=self.source_address,
-                            ssl_context=self.ssl_context
-                        )
-                    )
-
-                    if self.debug:
-                        print(f'🔐 Rotated TLS cipher suite (rotation #{self._cipher_rotation_count})')
-                        print(f'    Using {len(selected_ciphers)} ciphers starting from index {start_index}')
-
+                with self._state_lock:
+                    self._cipher_rotation_count += 1
+                    cipher_index = self._cipher_rotation_count % len(available_ciphers)
+                    num_ciphers = min(8, len(available_ciphers))
+                    start_index = cipher_index % (len(available_ciphers) - num_ciphers + 1)
+                    selected_ciphers = available_ciphers[start_index:start_index + num_ciphers]
+                    new_cipher_suite = ':'.join(selected_ciphers)
+                    if new_cipher_suite != self.cipherSuite:
+                        self.cipherSuite = new_cipher_suite
+                        self._explicit_cipherSuite = True
+                        try:
+                            from curl_cffi.const import CurlOpt
+                            self.curl_options[CurlOpt.SSL_CIPHER_LIST] = self.cipherSuite
+                            if self.ecdhCurve:
+                                self.curl_options[CurlOpt.SSL_EC_CURVES] = self.ecdhCurve
+                        except (ImportError, AttributeError):
+                            pass
+                        if self.debug:
+                            print(f'Rotated TLS cipher suite (rotation #{self._cipher_rotation_count})')
+                            print(f'    Using {len(selected_ciphers)} ciphers starting from index {start_index}')
         except Exception as e:
             if self.debug:
-                print(f'⚠️ TLS cipher rotation failed: {e}')
+                print(f'TLS cipher rotation failed: {e}')
 
+    # ------------------------------------------------------------------------------- #
+    # Factory methods
     # ------------------------------------------------------------------------------- #
 
     @classmethod
     def create_scraper(cls, sess=None, **kwargs):
-        """
-        Convenience function for creating a ready-to-go CloudScraper object.
-
-        Additional parameters:
-        - rotating_proxies: List of proxy URLs or dict mapping URL schemes to proxy URLs
-        - proxy_options: Dict with proxy configuration options
-            - rotation_strategy: Strategy for rotating proxies ('sequential', 'random', or 'smart')
-            - ban_time: Time in seconds to ban a proxy after a failure
-        - enable_stealth: Whether to enable stealth mode (default: True)
-        - stealth_options: Dict with stealth mode configuration options
-            - min_delay: Minimum delay between requests in seconds
-            - max_delay: Maximum delay between requests in seconds
-            - human_like_delays: Whether to add random delays between requests
-            - randomize_headers: Whether to randomize headers
-            - browser_quirks: Whether to apply browser-specific quirks
-        - session_refresh_interval: Time in seconds after which to refresh session (default: 3600)
-        - auto_refresh_on_403: Whether to automatically refresh session on 403 errors (default: True)
-        - max_403_retries: Maximum number of 403 retry attempts (default: 3)
-        - min_request_interval: Minimum time in seconds between requests (default: 1.0)
-        - max_concurrent_requests: Maximum number of concurrent requests (default: 1)
-        - rotate_tls_ciphers: Whether to rotate TLS cipher suites to avoid detection (default: True)
-        - disableCloudflareV3: Whether to disable Cloudflare v3 JavaScript VM challenge handling (default: False)
-        - disableTurnstile: Whether to disable Cloudflare Turnstile challenge handling (default: False)
-        """
         scraper = cls(**kwargs)
-
         if sess:
-            for attr in ['auth', 'cert', 'cookies', 'headers', 'hooks', 'params', 'proxies', 'data']:
-                val = getattr(sess, attr, None)
-                if val is not None:
-                    setattr(scraper, attr, val)
-
+            clone_session_attrs(sess, scraper, FINGERPRINT_HEADER_KEYS)
         return scraper
 
-    # ------------------------------------------------------------------------------- #
-    # Functions for integrating cloudscraper with other applications and scripts
     # ------------------------------------------------------------------------------- #
 
     @classmethod
     def get_tokens(cls, url, **kwargs):
-        """
-        Get Cloudflare tokens for a URL
-
-        Additional parameters:
-        - rotating_proxies: List of proxy URLs or dict mapping URL schemes to proxy URLs
-        - proxy_options: Dict with proxy configuration options
-        - enable_stealth: Whether to enable stealth mode (default: True)
-        - stealth_options: Dict with stealth mode configuration options
-        - session_refresh_interval: Time in seconds after which to refresh session (default: 3600)
-        - auto_refresh_on_403: Whether to automatically refresh session on 403 errors (default: True)
-        - max_403_retries: Maximum number of 403 retry attempts (default: 3)
-        - disableCloudflareV3: Whether to disable Cloudflare v3 JavaScript VM challenge handling (default: False)
-        - disableTurnstile: Whether to disable Cloudflare Turnstile challenge handling (default: False)
-        """
         scraper = cls.create_scraper(
             **{
                 field: kwargs.pop(field, None) for field in [
-                    'allow_brotli',
-                    'browser',
-                    'debug',
-                    'delay',
-                    'doubleDown',
-                    'captcha',
-                    'interpreter',
-                    'source_address',
-                    'requestPreHook',
-                    'requestPostHook',
-                    'rotating_proxies',
-                    'proxy_options',
-                    'enable_stealth',
-                    'stealth_options',
-                    'session_refresh_interval',
-                    'auto_refresh_on_403',
-                    'max_403_retries',
-                    'disableCloudflareV3',
-                    'disableTurnstile'
+                    'allow_brotli', 'browser', 'debug', 'delay',
+                    'doubleDown', 'captcha', 'interpreter', 'source_address',
+                    'requestPreHook', 'requestPostHook',
+                    'rotating_proxies', 'proxy_options',
+                    'enable_stealth', 'stealth_options',
+                    'session_refresh_interval', 'auto_refresh_on_403',
+                    'max_403_retries', 'disableCloudflareV3',
+                    'disableTurnstile', 'impersonate',
                 ] if field in kwargs
             }
         )
@@ -749,13 +683,16 @@ class CloudScraper(Session):
         domain = urlparse(resp.url).netloc
         cookie_domain = None
 
-        for d in scraper.cookies.list_domains():
-            if d.startswith('.') and d in (f'.{domain}'):
+        cookie_domains = set()
+        for cookie in scraper.cookies.jar:
+            cookie_domains.add(cookie.domain)
+
+        for d in cookie_domains:
+            if d.startswith('.') and d == f'.{domain}':
                 cookie_domain = d
                 break
         else:
-            # Try without the dot prefix
-            for d in scraper.cookies.list_domains():
+            for d in cookie_domains:
                 if d == domain:
                     cookie_domain = d
                     break
@@ -767,34 +704,18 @@ class CloudScraper(Session):
                     "have Cloudflare IUAM (I'm Under Attack Mode) enabled?"
                 )
 
-        # Get all Cloudflare cookies
         cf_cookies = {}
         for cookie_name in ['cf_clearance', 'cf_chl_2', 'cf_chl_prog', 'cf_chl_rc_ni', 'cf_turnstile']:
             cookie_value = scraper.cookies.get(cookie_name, '', domain=cookie_domain)
             if cookie_value:
                 cf_cookies[cookie_name] = cookie_value
 
-        return (
-            cf_cookies,
-            scraper.headers['User-Agent']
-        )
+        return (cf_cookies, scraper.headers['User-Agent'])
 
     # ------------------------------------------------------------------------------- #
 
     @classmethod
     def get_cookie_string(cls, url, **kwargs):
-        """
-        Convenience function for building a Cookie HTTP header value.
-
-        Additional parameters:
-        - rotating_proxies: List of proxy URLs or dict mapping URL schemes to proxy URLs
-        - proxy_options: Dict with proxy configuration options
-        - enable_stealth: Whether to enable stealth mode (default: True)
-        - stealth_options: Dict with stealth mode configuration options
-        - session_refresh_interval: Time in seconds after which to refresh session (default: 3600)
-        - auto_refresh_on_403: Whether to automatically refresh session on 403 errors (default: True)
-        - max_403_retries: Maximum number of 403 retry attempts (default: 3)
-        """
         tokens, user_agent = cls.get_tokens(url, **kwargs)
         return '; '.join('='.join(pair) for pair in tokens.items()), user_agent
 
@@ -814,3 +735,9 @@ create_scraper = CloudScraper.create_scraper
 session = CloudScraper.create_scraper
 get_tokens = CloudScraper.get_tokens
 get_cookie_string = CloudScraper.get_cookie_string
+
+
+def create_async_scraper(**kwargs):
+    """Lazy-loaded factory for AsyncCloudScraper."""
+    from .async_scraper import create_async_scraper as _create
+    return _create(**kwargs)

@@ -164,7 +164,7 @@ class CloudflareV2():
             challenge_info = self.extract_challenge_data(resp)
             
             # Wait for the specified delay
-            time.sleep(self.delay)
+            self.cloudscraper._sleep(self.delay)
             
             # Generate the challenge payload
             payload = self.generate_challenge_payload(challenge_info['challenge_data'], resp)

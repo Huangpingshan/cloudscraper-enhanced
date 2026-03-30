@@ -164,6 +164,23 @@ class Cloudflare():
         return False
 
     # ------------------------------------------------------------------------------- #
+    # Pure detection — no side effects, safe to call without an instance.
+    # ------------------------------------------------------------------------------- #
+
+    @staticmethod
+    def is_Any_V1_Challenge(resp):
+        """Return True if the response looks like any v1-era challenge.
+
+        This is a pure detection helper with no side effects (no exceptions
+        raised).  Used by AsyncCloudScraper for challenge detection.
+        """
+        return bool(
+            Cloudflare.is_Firewall_Blocked(resp)
+            or Cloudflare.is_Captcha_Challenge(resp)
+            or Cloudflare.is_IUAM_Challenge(resp)
+        )
+
+    # ------------------------------------------------------------------------------- #
     # Wrapper for is_Captcha_Challenge, is_IUAM_Challenge, is_Firewall_Blocked
     # ------------------------------------------------------------------------------- #
 
@@ -395,7 +412,7 @@ class Cloudflare():
                         "Cloudflare IUAM possibility malformed, issue extracing delay value."
                     )
 
-            time.sleep(self.cloudscraper.delay)
+            self.cloudscraper._sleep(self.cloudscraper.delay)
 
             # ------------------------------------------------------------------------------- #
 

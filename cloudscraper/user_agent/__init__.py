@@ -68,7 +68,6 @@ class User_Agent():
             self.mobile = kwargs.pop('mobile', True)
 
         if not self.desktop and not self.mobile:
-            sys.tracebacklimit = 0
             raise RuntimeError("Sorry you can't have mobile and desktop disabled at the same time.")
 
         try:
@@ -83,7 +82,6 @@ class User_Agent():
             # Fallback for executable environments
             try:
                 # Try alternative paths for executables
-                import sys
                 if getattr(sys, 'frozen', False):
                     # Running in a PyInstaller bundle
                     bundle_dir = sys._MEIPASS
@@ -200,14 +198,12 @@ class User_Agent():
                 ])
         else:
             if self.browser and self.browser not in self.browsers:
-                sys.tracebacklimit = 0
                 raise RuntimeError(f'Sorry "{self.browser}" browser is not valid, valid browsers are [{", ".join(self.browsers)}].')
 
             if not self.platform:
                 self.platform = random.SystemRandom().choice(self.platforms)
 
             if self.platform not in self.platforms:
-                sys.tracebacklimit = 0
                 raise RuntimeError(f'Sorry the platform "{self.platform}" is not valid, valid platforms are [{", ".join(self.platforms)}]')
 
             filteredAgents = self.filterAgents(user_agents['user_agents'])
@@ -218,7 +214,6 @@ class User_Agent():
                     self.browser = random.SystemRandom().choice(list(filteredAgents.keys()))
 
             if not filteredAgents[self.browser]:
-                sys.tracebacklimit = 0
                 raise RuntimeError(f'Sorry "{self.browser}" browser was not found with a platform of "{self.platform}".')
 
             self.cipherSuite = user_agents['cipherSuite'][self.browser]
