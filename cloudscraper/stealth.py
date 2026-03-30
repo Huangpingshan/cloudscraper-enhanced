@@ -67,7 +67,7 @@ class StealthMode:
 
     # ------------------------------------------------------------------------------- #
 
-    def apply_stealth_techniques(self, method, url, **kwargs):
+    def apply_stealth_techniques(self, method, url, apply_delay=True, **kwargs):
         """
         Apply stealth techniques to the request
         
@@ -77,7 +77,7 @@ class StealthMode:
         :return: Modified kwargs
         """
         # Apply human-like delays between requests
-        if self.human_like_delays:
+        if apply_delay and self.human_like_delays:
             self._apply_human_like_delay()
             
         # Randomize headers to look more like a browser
@@ -114,6 +114,23 @@ class StealthMode:
             if delay >= 0.1:
                 logging.debug(f"Applying human-like delay of {delay:.2f} seconds")
                 self.cloudscraper._sleep(delay)
+
+    # ------------------------------------------------------------------------------- #
+
+    def compute_human_like_delay(self):
+        """Return the delay value (in seconds) without sleeping.
+
+        Useful for async callers that need to ``await asyncio.sleep(delay)``
+        instead of blocking.  Returns 0.0 when no delay is needed.
+        """
+        with self._lock:
+            should_delay = self.request_count > 0
+        if not should_delay:
+            return 0.0
+        delay = random.uniform(self.min_delay, self.max_delay)
+        if random.random() < _DELAY_SPIKE_PROBABILITY:
+            delay *= _DELAY_SPIKE_MULTIPLIER
+        return min(delay, 10.0)
 
     # ------------------------------------------------------------------------------- #
 

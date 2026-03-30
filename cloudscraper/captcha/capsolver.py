@@ -26,6 +26,9 @@ from . import Captcha
 class captchaSolver(Captcha):
     def __init__(self):
         super(captchaSolver, self).__init__('capsolver')
+        self.api_key = None
+        self.app_id = '9E717405-8C70-49B3-B277-7C2F2196484B'
+        self.proxy = None
         self.host = 'https://api.capsolver.com'
         self.session = requests.Session()
         self.captchaType = {
