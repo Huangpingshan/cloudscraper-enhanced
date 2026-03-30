@@ -3,18 +3,18 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cloudscraper"
-version = "3.0.0"
-description = "Enhanced Python module to bypass Cloudflare's anti-bot page with support for v2 challenges, proxy rotation, and stealth mode."
+name = "cloudscraper-enhanced"
+version = "3.1.0"
+description = "Enhanced Python module to bypass Cloudflare's anti-bot page with async support, v2/v3 challenges, proxy rotation, and stealth mode. Fork of cloudscraper."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
     {name = "VeNoMouS", email = "venom@cloudscraper.io"},
-    {name = "Zied Boughdir", email = "ziedboughdir@gmail.com"}
+    {name = "Zied Boughdir", email = "ziedboughdir@gmail.com"},
+    {name = "Huangpingshan"}
 ]
 maintainers = [
-    {name = "Zied Boughdir", email = "venom@cloudscraper.io"},
-    {name = "Zied Boughdir", email = "ziedboughdir@gmail.com"}
+    {name = "Huangpingshan"}
 ]
 keywords = [
     "cloudflare",
@@ -78,10 +78,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/venomous/cloudscraper"
-Repository = "https://github.com/venomous/cloudscraper.git"
-Issues = "https://github.com/venomous/cloudscraper/issues"
-Changelog = "https://github.com/venomous/cloudscraper/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/Huangpingshan/cloudscraper-enhanced"
+Repository = "https://github.com/Huangpingshan/cloudscraper-enhanced.git"
+Issues = "https://github.com/Huangpingshan/cloudscraper-enhanced/issues"
 
 [tool.setuptools.packages.find]
 include = ["cloudscraper*"]
